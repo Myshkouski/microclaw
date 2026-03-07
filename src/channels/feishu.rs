@@ -1038,6 +1038,9 @@ fn looks_like_feishu_reaction_token(text: &str) -> Option<String> {
     if trimmed.len() > 64 {
         return None;
     }
+    if trimmed.eq_ignore_ascii_case("ok") {
+        return None;
+    }
     if map_feishu_reaction_emoji_type(trimmed).is_some() {
         return Some(trimmed.to_string());
     }
@@ -1385,7 +1388,6 @@ fn map_feishu_reaction_emoji_type(token: &str) -> Option<&'static str> {
         "rocket" => Some("ROCKET"),
         "letmesee" => Some("LetMeSee"),
         "speechless" => Some("SPEECHLESS"),
-        "ok" => Some("OK"),
         _ => None,
     }
 }
@@ -3012,7 +3014,7 @@ mod mention_tests {
         );
         assert_eq!(
             looks_like_feishu_reaction_token("ok"),
-            Some("ok".to_string())
+            None
         );
         assert_eq!(looks_like_feishu_reaction_token("hello world"), None);
     }

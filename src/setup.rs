@@ -1061,22 +1061,23 @@ impl SetupApp {
                     secret: false,
                 },
                 Field {
-                    key: "OVERRIDE_TIMEZONE".into(),
-                    label: "Override timezone (optional, IANA)".into(),
-                    value: existing
-                        .get("OVERRIDE_TIMEZONE")
-                        .cloned()
-                        .unwrap_or_default(),
-                    required: false,
-                    secret: false,
-                },
-                Field {
                     key: "WORKING_DIR".into(),
                     label: "Working directory".into(),
                     value: existing
                         .get("WORKING_DIR")
                         .cloned()
                         .unwrap_or_else(default_working_dir_for_setup),
+                    required: false,
+                    secret: false,
+                },
+                Field {
+                    key: "OVERRIDE_TIMEZONE".into(),
+                    label: "Override timezone (optional, IANA; default uses system timezone)"
+                        .into(),
+                    value: existing
+                        .get("OVERRIDE_TIMEZONE")
+                        .cloned()
+                        .unwrap_or_default(),
                     required: false,
                     secret: false,
                 },
@@ -3653,8 +3654,8 @@ impl SetupApp {
             }
             // 3) App
             "DATA_DIR" => ORDER_APP_BASE,
-            "OVERRIDE_TIMEZONE" => ORDER_APP_BASE + 1,
-            "WORKING_DIR" => ORDER_APP_BASE + 2,
+            "WORKING_DIR" => ORDER_APP_BASE + 1,
+            "OVERRIDE_TIMEZONE" => ORDER_APP_BASE + 2,
             "SOULS_DIR" => ORDER_APP_BASE + 3,
             // 4) Memory
             "REFLECTOR_ENABLED" => ORDER_MEMORY_BASE,
@@ -4524,13 +4525,6 @@ fn save_config_yaml(
 
     yaml.push('\n');
     yaml.push_str(&format!("data_dir: {}\n", yaml_double_quoted(&data_dir)));
-    let override_tz = values.get("OVERRIDE_TIMEZONE").cloned().unwrap_or_default();
-    yaml.push_str(
-        "# Optional timezone override (IANA), e.g. Asia/Shanghai. Leave empty to use system timezone.\n",
-    );
-    if !override_tz.trim().is_empty() && !override_tz.eq_ignore_ascii_case("auto") {
-        yaml.push_str(&format!("override_timezone: \"{}\"\n", override_tz));
-    }
     let working_dir = values
         .get("WORKING_DIR")
         .cloned()
@@ -4539,6 +4533,13 @@ fn save_config_yaml(
         "working_dir: {}\n",
         yaml_double_quoted(&working_dir)
     ));
+    let override_tz = values.get("OVERRIDE_TIMEZONE").cloned().unwrap_or_default();
+    yaml.push_str(
+        "# Optional timezone override (IANA), e.g. Asia/Shanghai. Default: system timezone.\n",
+    );
+    if !override_tz.trim().is_empty() && !override_tz.eq_ignore_ascii_case("auto") {
+        yaml.push_str(&format!("override_timezone: \"{}\"\n", override_tz));
+    }
     let high_risk_confirm_required = values
         .get("HIGH_RISK_TOOL_USER_CONFIRMATION_REQUIRED")
         .map(|v| {

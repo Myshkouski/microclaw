@@ -23,7 +23,7 @@ use crate::codex_auth::{
     codex_config_default_openai_base_url, is_openai_codex_provider, provider_allows_empty_api_key,
     qwen_oauth_file_has_access_token, resolve_openai_codex_auth, resolve_qwen_portal_auth,
 };
-use crate::config::{Config, SandboxBackend, SandboxMode};
+use crate::config::{Config, LlmProviderProfile, SandboxBackend, SandboxMode};
 use crate::http_client::llm_user_agent;
 use microclaw_core::error::MicroClawError;
 use microclaw_core::text::floor_char_boundary;
@@ -227,6 +227,10 @@ fn discord_llm_base_url_key() -> &'static str {
     "DISCORD_LLM_BASE_URL"
 }
 
+fn llm_provider_presets_json_key() -> &'static str {
+    "LLM_PROVIDER_PRESETS_JSON"
+}
+
 fn dynamic_bot_count_field_key(channel: &str) -> String {
     format!("DYN_{}_BOT_COUNT", channel.to_uppercase())
 }
@@ -398,6 +402,43 @@ fn parse_accounts_json_value(
         }
     }
     Ok(Some(obj))
+}
+
+fn parse_provider_presets_json_value(
+    raw: &str,
+    field_key: &str,
+) -> Result<HashMap<String, LlmProviderProfile>, MicroClawError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut presets: HashMap<String, LlmProviderProfile> =
+        serde_json::from_str(trimmed).map_err(|e| {
+            MicroClawError::Config(format!(
+                "{field_key} must be a valid JSON object {{preset_id: {{provider,...}}}}: {e}"
+            ))
+        })?;
+    let mut normalized = HashMap::new();
+    for (preset_id, profile) in presets.drain() {
+        let preset_id = preset_id.trim().to_ascii_lowercase();
+        if preset_id.is_empty() {
+            return Err(MicroClawError::Config(format!(
+                "{field_key} contains an empty preset id"
+            )));
+        }
+        if preset_id == "main" {
+            return Err(MicroClawError::Config(format!(
+                "{field_key} preset id 'main' is reserved for the global default"
+            )));
+        }
+        if !is_valid_account_id(&preset_id) {
+            return Err(MicroClawError::Config(format!(
+                "{field_key} contains invalid preset id '{preset_id}' (allowed: letters, numbers, '_' or '-')"
+            )));
+        }
+        normalized.insert(preset_id, profile);
+    }
+    Ok(normalized)
 }
 
 fn append_yaml_value(yaml: &mut String, indent: usize, value: &serde_yaml::Value) {
@@ -940,6 +981,7 @@ struct SetupApp {
     completion_summary: Vec<String>,
     llm_override_page: Option<LlmOverridePage>,
     llm_override_picker: Option<LlmOverridePicker>,
+    provider_preset_page: Option<ProviderPresetPage>,
 }
 
 #[derive(Clone)]
@@ -949,6 +991,7 @@ struct LlmOverridePage {
     provider_key: String,
     api_key_key: String,
     base_url_key: String,
+    show_legacy_fields: bool,
     selected: usize,
     editing: bool,
 }
@@ -959,6 +1002,32 @@ struct LlmOverridePicker {
     target_key: String,
     options: Vec<(String, String)>,
     selected: usize,
+}
+
+#[derive(Clone)]
+struct ProviderPresetDraft {
+    id: String,
+    provider: String,
+    api_key: String,
+    base_url: String,
+    default_model: String,
+    models_csv: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProviderPresetPageMode {
+    List,
+    Edit,
+}
+
+#[derive(Clone)]
+struct ProviderPresetPage {
+    entries: Vec<ProviderPresetDraft>,
+    selected: usize,
+    mode: ProviderPresetPageMode,
+    field_selected: usize,
+    editing: bool,
+    picker: Option<LlmOverridePicker>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1388,6 +1457,16 @@ impl SetupApp {
                     secret: false,
                 },
                 Field {
+                    key: llm_provider_presets_json_key().into(),
+                    label: "LLM provider presets JSON (optional)".into(),
+                    value: existing
+                        .get(llm_provider_presets_json_key())
+                        .cloned()
+                        .unwrap_or_default(),
+                    required: false,
+                    secret: false,
+                },
+                Field {
                     key: "SHOW_THINKING".into(),
                     label: "Show thinking/reasoning text (true/false)".into(),
                     value: existing
@@ -1547,6 +1626,7 @@ impl SetupApp {
             completion_summary: Vec::new(),
             llm_override_page: None,
             llm_override_picker: None,
+            provider_preset_page: None,
         };
 
         for slot in 1..=MAX_BOT_SLOTS {
@@ -2461,6 +2541,22 @@ impl SetupApp {
                     if config.llm_user_agent != crate::http_client::default_llm_user_agent() {
                         map.insert("LLM_USER_AGENT".into(), config.llm_user_agent);
                     }
+                    let presets_for_setup = if !config.provider_presets.is_empty() {
+                        config.provider_presets.clone()
+                    } else {
+                        config
+                            .llm_providers
+                            .clone()
+                            .into_iter()
+                            .filter(|(alias, _)| !alias.eq_ignore_ascii_case("main"))
+                            .collect()
+                    };
+                    if !presets_for_setup.is_empty() {
+                        let presets_json = serde_json::to_string(&presets_for_setup).ok();
+                        if let Some(presets_json) = presets_json {
+                            map.insert(llm_provider_presets_json_key().into(), presets_json);
+                        }
+                    }
                     map.insert("SHOW_THINKING".into(), config.show_thinking.to_string());
                     map.insert("DATA_DIR".into(), config.data_dir);
                     map.insert(
@@ -2594,17 +2690,453 @@ impl SetupApp {
         }
     }
 
+    fn llm_provider_presets(&self) -> HashMap<String, LlmProviderProfile> {
+        parse_provider_presets_json_value(
+            &self.field_value(llm_provider_presets_json_key()),
+            llm_provider_presets_json_key(),
+        )
+        .unwrap_or_default()
+    }
+
+    fn provider_preset_drafts(&self) -> Vec<ProviderPresetDraft> {
+        let mut entries: Vec<(String, LlmProviderProfile)> =
+            self.llm_provider_presets().into_iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
+            .into_iter()
+            .map(|(id, profile)| ProviderPresetDraft {
+                id,
+                provider: profile.provider.unwrap_or_default(),
+                api_key: profile.api_key.unwrap_or_default(),
+                base_url: profile.llm_base_url.unwrap_or_default(),
+                default_model: profile.default_model.unwrap_or_default(),
+                models_csv: profile.models.join(","),
+            })
+            .collect()
+    }
+
+    fn serialize_provider_preset_drafts(
+        drafts: &[ProviderPresetDraft],
+    ) -> Result<String, MicroClawError> {
+        let mut presets = HashMap::new();
+        for draft in drafts {
+            let id = draft.id.trim().to_ascii_lowercase();
+            if id.is_empty() {
+                continue;
+            }
+            if id == "main" {
+                return Err(MicroClawError::Config(
+                    "provider preset id 'main' is reserved for the global default".into(),
+                ));
+            }
+            if !is_valid_account_id(&id) {
+                return Err(MicroClawError::Config(format!(
+                    "provider preset id '{id}' must use only letters, numbers, '_' or '-'"
+                )));
+            }
+            let models = parse_string_list_field(&draft.models_csv)?;
+            let profile = LlmProviderProfile {
+                provider: Some(draft.provider.trim().to_ascii_lowercase())
+                    .filter(|v| !v.is_empty()),
+                api_key: Some(draft.api_key.trim().to_string()).filter(|v| !v.is_empty()),
+                llm_base_url: Some(draft.base_url.trim().to_string()).filter(|v| !v.is_empty()),
+                default_model: Some(draft.default_model.trim().to_string())
+                    .filter(|v| !v.is_empty()),
+                models,
+            };
+            presets.insert(id, profile);
+        }
+        serde_json::to_string(&presets).map_err(|e| {
+            MicroClawError::Config(format!("Failed to serialize provider presets: {e}"))
+        })
+    }
+
+    fn sync_provider_preset_page_field(&mut self) -> Result<(), MicroClawError> {
+        let Some(page) = self.provider_preset_page.as_ref() else {
+            return Ok(());
+        };
+        let json = Self::serialize_provider_preset_drafts(&page.entries)?;
+        self.set_field_value(llm_provider_presets_json_key(), json);
+        Ok(())
+    }
+
+    fn next_provider_preset_id(entries: &[ProviderPresetDraft]) -> String {
+        let mut used = entries
+            .iter()
+            .map(|entry| entry.id.trim().to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        used.sort();
+        for idx in 1usize.. {
+            let candidate = idx.to_string();
+            if !used.iter().any(|id| id == &candidate) {
+                return candidate;
+            }
+        }
+        "1".to_string()
+    }
+
+    fn open_provider_preset_page(&mut self) {
+        self.provider_preset_page = Some(ProviderPresetPage {
+            entries: self.provider_preset_drafts(),
+            selected: 0,
+            mode: ProviderPresetPageMode::List,
+            field_selected: 0,
+            editing: false,
+            picker: None,
+        });
+        self.status = "Editing provider presets".to_string();
+    }
+
+    fn provider_preset_references(&self, preset_id: &str) -> Vec<String> {
+        let needle = preset_id.trim();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let mut refs = Vec::new();
+        if self
+            .field_value(telegram_llm_provider_key())
+            .eq_ignore_ascii_case(needle)
+        {
+            refs.push("telegram channel".to_string());
+        }
+        if self
+            .field_value(discord_llm_provider_key())
+            .eq_ignore_ascii_case(needle)
+        {
+            refs.push("discord channel".to_string());
+        }
+        for ch in DYNAMIC_CHANNELS {
+            for slot in 1..=MAX_BOT_SLOTS {
+                let key = dynamic_slot_llm_provider_key(ch.name, slot);
+                if self.field_value(&key).eq_ignore_ascii_case(needle) {
+                    let id = self.field_value(&dynamic_slot_id_field_key(ch.name, slot));
+                    let label = if id.trim().is_empty() {
+                        format!("{}.bot{}", ch.name, slot)
+                    } else {
+                        format!("{}.{}", ch.name, id.trim())
+                    };
+                    refs.push(label);
+                }
+            }
+        }
+        refs.sort();
+        refs.dedup();
+        refs
+    }
+
+    fn provider_preset_reference_summary(&self, preset_id: &str) -> String {
+        let refs = self.provider_preset_references(preset_id);
+        if refs.is_empty() {
+            "unused".to_string()
+        } else {
+            format!("{} ref(s)", refs.len())
+        }
+    }
+
+    fn provider_preset_field_labels() -> [&'static str; 6] {
+        [
+            "Preset ID",
+            "Provider",
+            "API key",
+            "Base URL",
+            "Default model",
+            "Models (csv)",
+        ]
+    }
+
+    fn provider_preset_selected_field_value(page: &ProviderPresetPage) -> String {
+        let Some(entry) = page.entries.get(page.selected) else {
+            return String::new();
+        };
+        match page.field_selected {
+            0 => entry.id.clone(),
+            1 => entry.provider.clone(),
+            2 => entry.api_key.clone(),
+            3 => entry.base_url.clone(),
+            4 => entry.default_model.clone(),
+            5 => entry.models_csv.clone(),
+            _ => String::new(),
+        }
+    }
+
+    fn rename_provider_preset_references(&mut self, old_id: &str, new_id: &str) -> usize {
+        let old_id = old_id.trim();
+        if old_id.is_empty() || old_id.eq_ignore_ascii_case(new_id.trim()) {
+            return 0;
+        }
+        let mut updated = 0usize;
+        let mut maybe_replace = |key: &str, this: &mut SetupApp| {
+            if this.field_value(key).eq_ignore_ascii_case(old_id) {
+                this.set_field_value(key, new_id.trim().to_string());
+                updated += 1;
+            }
+        };
+        maybe_replace(telegram_llm_provider_key(), self);
+        maybe_replace(discord_llm_provider_key(), self);
+        for ch in DYNAMIC_CHANNELS {
+            for slot in 1..=MAX_BOT_SLOTS {
+                let key = dynamic_slot_llm_provider_key(ch.name, slot);
+                maybe_replace(&key, self);
+            }
+        }
+        updated
+    }
+
+    fn selected_provider_preset_id(&self) -> Option<String> {
+        self.provider_preset_page
+            .as_ref()
+            .and_then(|page| page.entries.get(page.selected))
+            .map(|entry| entry.id.trim().to_string())
+            .filter(|id| !id.is_empty())
+    }
+
+    fn delete_selected_provider_preset(
+        &mut self,
+        fallback_to_main: bool,
+    ) -> Result<Vec<String>, MicroClawError> {
+        let Some(preset_id) = self.selected_provider_preset_id() else {
+            return Ok(Vec::new());
+        };
+        let refs = self.provider_preset_references(&preset_id);
+        if !refs.is_empty() && !fallback_to_main {
+            return Err(MicroClawError::Config(format!(
+                "Preset '{preset_id}' is still referenced by {}. Press x to reset those references to main and delete it.",
+                refs.join(", ")
+            )));
+        }
+        let reset_refs = if fallback_to_main { refs } else { Vec::new() };
+        if fallback_to_main {
+            self.rename_provider_preset_references(&preset_id, "");
+        }
+        if let Some(page) = self.provider_preset_page.as_mut() {
+            if page.selected < page.entries.len() {
+                page.entries.remove(page.selected);
+                if page.selected >= page.entries.len() && !page.entries.is_empty() {
+                    page.selected = page.entries.len() - 1;
+                }
+            }
+        }
+        self.sync_provider_preset_page_field()?;
+        Ok(reset_refs)
+    }
+
+    fn set_provider_preset_selected_field_value(&mut self, value: String) {
+        let mut old_id = String::new();
+        let mut rename_target = false;
+        let new_value_for_rename = value.clone();
+        if let Some(page) = self.provider_preset_page.as_ref() {
+            if page.field_selected == 0 {
+                old_id = Self::provider_preset_selected_field_value(page);
+                rename_target = true;
+            }
+        }
+        if let Some(page) = self.provider_preset_page.as_mut() {
+            let Some(entry) = page.entries.get_mut(page.selected) else {
+                return;
+            };
+            match page.field_selected {
+                0 => entry.id = value.clone(),
+                1 => entry.provider = value,
+                2 => entry.api_key = value,
+                3 => entry.base_url = value,
+                4 => entry.default_model = value,
+                5 => entry.models_csv = value,
+                _ => {}
+            }
+        }
+        if rename_target {
+            self.rename_provider_preset_references(&old_id, &new_value_for_rename);
+        }
+    }
+
+    fn open_provider_preset_provider_picker(&mut self) {
+        let Some(page) = self.provider_preset_page.as_ref() else {
+            return;
+        };
+        let current = page
+            .entries
+            .get(page.selected)
+            .map(|entry| entry.provider.clone())
+            .unwrap_or_default();
+        let mut options = PROVIDER_PRESETS
+            .iter()
+            .map(|preset| {
+                (
+                    format!("{} - {}", preset.id, preset.label),
+                    preset.id.to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if !current.trim().is_empty()
+            && !options
+                .iter()
+                .any(|(_, value)| value.eq_ignore_ascii_case(current.trim()))
+        {
+            options.push((
+                format!("{} - legacy/manual", current.trim()),
+                current.clone(),
+            ));
+        }
+        let selected = options
+            .iter()
+            .position(|(_, value)| value.eq_ignore_ascii_case(current.trim()))
+            .unwrap_or(0);
+        if let Some(page_mut) = self.provider_preset_page.as_mut() {
+            page_mut.picker = Some(LlmOverridePicker {
+                title: "Select Provider".to_string(),
+                target_key: "provider".to_string(),
+                options,
+                selected,
+            });
+        }
+    }
+
+    fn open_provider_preset_model_picker(&mut self) {
+        let (provider_value, current_default_model) = {
+            let Some(page) = self.provider_preset_page.as_ref() else {
+                return;
+            };
+            let Some(entry) = page.entries.get(page.selected) else {
+                return;
+            };
+            (entry.provider.clone(), entry.default_model.clone())
+        };
+        let provider = provider_value.trim().to_string();
+        let Some(preset) = find_provider_preset(&provider) else {
+            if let Some(page_mut) = self.provider_preset_page.as_mut() {
+                page_mut.editing = true;
+            }
+            self.status = "Unknown provider; switched to manual model input".to_string();
+            return;
+        };
+        let mut options = preset
+            .models
+            .iter()
+            .map(|model| ((*model).to_string(), (*model).to_string()))
+            .collect::<Vec<_>>();
+        options.push((
+            MODEL_PICKER_MANUAL_INPUT.to_string(),
+            MODEL_PICKER_MANUAL_INPUT.to_string(),
+        ));
+        let selected = options
+            .iter()
+            .position(|(_, value)| value == &current_default_model)
+            .unwrap_or(options.len().saturating_sub(1));
+        if let Some(page_mut) = self.provider_preset_page.as_mut() {
+            page_mut.picker = Some(LlmOverridePicker {
+                title: format!("Select Model ({provider})"),
+                target_key: "default_model".to_string(),
+                options,
+                selected,
+            });
+        }
+    }
+
+    fn apply_provider_preset_picker_selection(&mut self) {
+        let status = {
+            let Some(page) = self.provider_preset_page.as_mut() else {
+                return;
+            };
+            let Some(picker) = page.picker.take() else {
+                return;
+            };
+            let Some((_, value)) = picker.options.get(picker.selected) else {
+                return;
+            };
+            if value == MODEL_PICKER_MANUAL_INPUT {
+                page.editing = true;
+                page.field_selected = 4;
+                self.status = "Editing default model (manual input)".to_string();
+                return;
+            }
+            let Some(entry) = page.entries.get_mut(page.selected) else {
+                return;
+            };
+            match picker.target_key.as_str() {
+                "provider" => {
+                    entry.provider = value.clone();
+                    if entry.default_model.trim().is_empty() {
+                        entry.default_model = default_model_for_provider(value).to_string();
+                    }
+                    if entry.base_url.trim().is_empty() {
+                        entry.base_url = find_provider_preset(value)
+                            .map(|preset| preset.default_base_url.to_string())
+                            .unwrap_or_default();
+                    }
+                }
+                "default_model" => entry.default_model = value.clone(),
+                _ => {}
+            }
+            Some(format!("Updated provider preset {}", entry.id))
+        };
+        let _ = self.sync_provider_preset_page_field();
+        if let Some(status) = status {
+            self.status = status;
+        }
+    }
+
+    fn llm_provider_preset_choices(&self, current: &str) -> Vec<(String, String)> {
+        let mut options = vec![("0 - main (global default)".to_string(), String::new())];
+        let mut presets: Vec<(String, LlmProviderProfile)> =
+            self.llm_provider_presets().into_iter().collect();
+        presets.sort_by(|a, b| a.0.cmp(&b.0));
+        for (preset_id, profile) in presets {
+            let provider = profile.provider.unwrap_or_else(|| preset_id.clone());
+            let model = profile.default_model.unwrap_or_default();
+            let suffix = if model.is_empty() {
+                provider
+            } else {
+                format!("{provider} / {model}")
+            };
+            options.push((format!("{preset_id} - {suffix}"), preset_id));
+        }
+        let trimmed_current = current.trim();
+        if !trimmed_current.is_empty()
+            && !options
+                .iter()
+                .any(|(_, value)| value.eq_ignore_ascii_case(trimmed_current))
+        {
+            options.push((
+                format!("{trimmed_current} - legacy/manual"),
+                trimmed_current.to_string(),
+            ));
+        }
+        options
+    }
+
+    fn llm_override_uses_legacy_fields(
+        &self,
+        provider_key: &str,
+        api_key_key: &str,
+        base_url_key: &str,
+    ) -> bool {
+        let provider = self.field_value(provider_key);
+        let api_key = self.field_value(api_key_key);
+        let base_url = self.field_value(base_url_key);
+        if !api_key.is_empty() || !base_url.is_empty() {
+            return true;
+        }
+        let provider = provider.trim();
+        if provider.is_empty() {
+            return false;
+        }
+        !self
+            .llm_provider_presets()
+            .keys()
+            .any(|preset| preset.eq_ignore_ascii_case(provider))
+    }
+
     fn llm_override_label_for_key(key: &str) -> &'static str {
         match key {
-            "TELEGRAM_LLM_PROVIDER" => "Provider (optional)",
+            "TELEGRAM_LLM_PROVIDER" => "Preset ID (optional; main=global)",
             "TELEGRAM_LLM_API_KEY" => "API key (optional)",
             "TELEGRAM_LLM_BASE_URL" => "Base URL (optional)",
-            "DISCORD_LLM_PROVIDER" => "Provider (optional)",
+            "DISCORD_LLM_PROVIDER" => "Preset ID (optional; main=global)",
             "DISCORD_LLM_API_KEY" => "API key (optional)",
             "DISCORD_LLM_BASE_URL" => "Base URL (optional)",
             "TELEGRAM_MODEL" => "Model (optional)",
             "DISCORD_MODEL" => "Model (optional)",
-            _ if key.ends_with("_LLM_PROVIDER") => "Provider (optional)",
+            _ if key.ends_with("_LLM_PROVIDER") => "Preset ID (optional; main=global)",
             _ if key.ends_with("_LLM_API_KEY") => "API key (optional)",
             _ if key.ends_with("_LLM_BASE_URL") => "Base URL (optional)",
             _ if key.ends_with("_MODEL") => "Model (optional)",
@@ -2620,12 +3152,15 @@ impl SetupApp {
         api_key_key: String,
         base_url_key: String,
     ) {
+        let show_legacy_fields =
+            self.llm_override_uses_legacy_fields(&provider_key, &api_key_key, &base_url_key);
         self.llm_override_page = Some(LlmOverridePage {
             title,
             model_key,
             provider_key,
             api_key_key,
             base_url_key,
+            show_legacy_fields,
             selected: 0,
             editing: false,
         });
@@ -2637,19 +3172,13 @@ impl SetupApp {
             return;
         };
         let current = self.field_value(&page.provider_key);
-        let mut options = Vec::new();
-        for preset in PROVIDER_PRESETS {
-            options.push((
-                format!("{} - {}", preset.id, preset.label),
-                preset.id.to_string(),
-            ));
-        }
+        let options = self.llm_provider_preset_choices(&current);
         let selected = options
             .iter()
             .position(|(_, value)| value.eq_ignore_ascii_case(&current))
             .unwrap_or(0);
         self.llm_override_picker = Some(LlmOverridePicker {
-            title: "Select Provider".to_string(),
+            title: "Select LLM Preset".to_string(),
             target_key: page.provider_key.clone(),
             options,
             selected,
@@ -2660,15 +3189,27 @@ impl SetupApp {
         let Some(page) = self.llm_override_page.as_ref() else {
             return;
         };
-        let provider = self.field_value(&page.provider_key);
-        let Some(preset) = find_provider_preset(&provider) else {
-            if let Some(page_mut) = self.llm_override_page.as_mut() {
-                page_mut.editing = true;
+        let provider_ref = self.field_value(&page.provider_key);
+        let provider_ref_normalized = provider_ref.trim().to_ascii_lowercase();
+        let mut provider_label = provider_ref.clone();
+        let mut models = if provider_ref.trim().is_empty() {
+            provider_label = self.field_value("LLM_PROVIDER");
+            self.model_options()
+        } else if let Some(profile) = self.llm_provider_presets().get(&provider_ref_normalized) {
+            provider_label = provider_ref_normalized.clone();
+            let mut models = profile.models.clone();
+            if let Some(default_model) = profile.default_model.clone() {
+                if !default_model.trim().is_empty() && !models.iter().any(|m| m == &default_model) {
+                    models.push(default_model);
+                }
             }
-            self.status = "Unknown provider; switched to manual model input".to_string();
-            return;
+            models
+        } else if let Some(preset) = find_provider_preset(&provider_ref_normalized) {
+            preset.models.iter().map(|m| (*m).to_string()).collect()
+        } else {
+            Vec::new()
         };
-        if preset.models.is_empty() {
+        if models.is_empty() {
             if let Some(page_mut) = self.llm_override_page.as_mut() {
                 page_mut.editing = true;
             }
@@ -2676,10 +3217,11 @@ impl SetupApp {
             return;
         }
         let current = self.field_value(&page.model_key);
-        let mut options = preset
-            .models
-            .iter()
-            .map(|m| ((*m).to_string(), (*m).to_string()))
+        models.sort();
+        models.dedup();
+        let mut options = models
+            .into_iter()
+            .map(|m| (m.clone(), m))
             .collect::<Vec<_>>();
         options.push((
             MODEL_PICKER_MANUAL_INPUT.to_string(),
@@ -2690,7 +3232,7 @@ impl SetupApp {
             .position(|(_, value)| value == &current)
             .unwrap_or(options.len().saturating_sub(1));
         self.llm_override_picker = Some(LlmOverridePicker {
-            title: format!("Select Model ({provider})"),
+            title: format!("Select Model ({provider_label})"),
             target_key: page.model_key.clone(),
             options,
             selected,
@@ -2716,13 +3258,13 @@ impl SetupApp {
         self.status = format!("Updated {}", picker.target_key);
     }
 
-    fn llm_override_keys_for_page(page: &LlmOverridePage) -> [&str; 4] {
-        [
-            page.provider_key.as_str(),
-            page.api_key_key.as_str(),
-            page.base_url_key.as_str(),
-            page.model_key.as_str(),
-        ]
+    fn llm_override_keys_for_page(page: &LlmOverridePage) -> Vec<&str> {
+        let mut keys = vec![page.provider_key.as_str(), page.model_key.as_str()];
+        if page.show_legacy_fields {
+            keys.push(page.api_key_key.as_str());
+            keys.push(page.base_url_key.as_str());
+        }
+        keys
     }
 
     fn open_llm_override_page_for_field(&mut self, field_key: &str) -> bool {
@@ -3288,6 +3830,10 @@ impl SetupApp {
                 web_hooks_allowed_session_key_prefixes_key()
             ))
         })?;
+        let _ = parse_provider_presets_json_value(
+            &self.field_value(llm_provider_presets_json_key()),
+            llm_provider_presets_json_key(),
+        )?;
 
         if self.channel_enabled("telegram") {
             let _ = parse_bot_count(
@@ -3920,6 +4466,10 @@ impl SetupApp {
                 });
                 true
             }
+            _ if selected_key == llm_provider_presets_json_key() => {
+                self.open_provider_preset_page();
+                true
+            }
             "OVERRIDE_TIMEZONE" => {
                 let options = self.timezone_picker_options();
                 let current = {
@@ -4127,6 +4677,7 @@ impl SetupApp {
                 .map(|p| p.default_base_url.to_string())
                 .unwrap_or_default(),
             "LLM_USER_AGENT" => String::new(),
+            _ if key == llm_provider_presets_json_key() => String::new(),
             "SHOW_THINKING" => "false".into(),
             "DATA_DIR" => default_data_dir_for_setup(),
             "OVERRIDE_TIMEZONE" => String::new(),
@@ -4202,6 +4753,7 @@ impl SetupApp {
             "REFLECTOR_ENABLED" | "REFLECTOR_INTERVAL_MINS" | "MEMORY_TOKEN_BUDGET" => "Memory",
             "LLM_PROVIDER" | "LLM_API_KEY" | "LLM_MODEL" | "LLM_BASE_URL" | "LLM_USER_AGENT"
             | "SHOW_THINKING" => "Model",
+            _ if key == llm_provider_presets_json_key() => "Model",
             "EMBEDDING_PROVIDER" | "EMBEDDING_API_KEY" | "EMBEDDING_BASE_URL"
             | "EMBEDDING_MODEL" | "EMBEDDING_DIM" => "Embedding",
             "A2A_ENABLED"
@@ -4268,6 +4820,10 @@ impl SetupApp {
             "LLM_USER_AGENT" => (
                 "HTTP User-Agent for LLM requests. Empty means automatic MicroClaw/<version>.",
                 "Example: OpenClaw-Gateway/1.0",
+            ),
+            _ if key == llm_provider_presets_json_key() => (
+                "Reusable preset definitions keyed by preset id. Channels/bots pick these ids instead of repeating provider details.",
+                "Example: {\"1\":{\"provider\":\"openai\",\"api_key\":\"sk-...\",\"default_model\":\"gpt-5.2\"},\"deepseek-hk\":{\"provider\":\"deepseek\",\"api_key\":\"sk-...\"}}",
             ),
             "SHOW_THINKING" => (
                 "Show model reasoning/thinking text in channel output when provider supports it.",
@@ -4416,8 +4972,8 @@ impl SetupApp {
                 "Example: qwen3.5-plus",
             ),
             _ if key.ends_with("_LLM_PROVIDER") => (
-                "Per-channel/per-account LLM provider override.",
-                "Example: openai",
+                "Per-channel/per-account preset id override. Empty means use main/global default.",
+                "Example: 1",
             ),
             _ if key.ends_with("_LLM_API_KEY") => (
                 "Per-channel/per-account API key override.",
@@ -4506,7 +5062,8 @@ impl SetupApp {
             "LLM_MODEL" => ORDER_MODEL_BASE + 2,
             "LLM_BASE_URL" => ORDER_MODEL_BASE + 3,
             "LLM_USER_AGENT" => ORDER_MODEL_BASE + 4,
-            "SHOW_THINKING" => ORDER_MODEL_BASE + 5,
+            _ if key == llm_provider_presets_json_key() => ORDER_MODEL_BASE + 5,
+            "SHOW_THINKING" => ORDER_MODEL_BASE + 6,
             // 2) Channel (dynamic channel fields are placed in the branch above)
             "ENABLED_CHANNELS" => ORDER_CHANNEL_BASE,
             "WEB_HOOKS_TOKEN" => ORDER_CHANNEL_BASE + 1,
@@ -5029,6 +5586,10 @@ fn save_config_yaml(
                 ))
             })?
     };
+    let provider_presets = parse_provider_presets_json_value(
+        &get(llm_provider_presets_json_key()),
+        llm_provider_presets_json_key(),
+    )?;
     let parse_usize_or_default = |raw: String, key: &str, default: usize| {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -5350,7 +5911,9 @@ fn save_config_yaml(
     if channel_selected("telegram") || telegram_present {
         yaml.push_str("  telegram:\n");
         yaml.push_str(&format!("    enabled: {}\n", channel_selected("telegram")));
-        if !telegram_llm_provider.trim().is_empty() {
+        if !telegram_llm_provider.trim().is_empty()
+            && !telegram_llm_provider.trim().eq_ignore_ascii_case("main")
+        {
             yaml.push_str(&format!(
                 "    provider_preset: \"{}\"\n",
                 telegram_llm_provider.trim()
@@ -5418,7 +5981,9 @@ fn save_config_yaml(
     if channel_selected("discord") || discord_present {
         yaml.push_str("  discord:\n");
         yaml.push_str(&format!("    enabled: {}\n", channel_selected("discord")));
-        if !discord_llm_provider.trim().is_empty() {
+        if !discord_llm_provider.trim().is_empty()
+            && !discord_llm_provider.trim().eq_ignore_ascii_case("main")
+        {
             yaml.push_str(&format!(
                 "    provider_preset: \"{}\"\n",
                 discord_llm_provider.trim()
@@ -5546,7 +6111,8 @@ fn save_config_yaml(
                 }
             }
             let llm_provider = get(&dynamic_slot_llm_provider_key(ch.name, slot));
-            if !llm_provider.trim().is_empty() {
+            if !llm_provider.trim().is_empty() && !llm_provider.trim().eq_ignore_ascii_case("main")
+            {
                 account.insert(
                     "provider_preset".into(),
                     serde_json::Value::String(llm_provider.trim().to_string()),
@@ -5687,14 +6253,25 @@ fn save_config_yaml(
         yaml.push_str("# LLM HTTP User-Agent (optional)\n");
         yaml.push_str(&format!("llm_user_agent: \"{}\"\n", llm_user_agent));
     }
-    yaml.push_str("# Optional reusable provider presets for per-bot/channel selection\n");
-    yaml.push_str("# provider_presets:\n");
-    yaml.push_str("#   lab-openai:\n");
-    yaml.push_str("#     provider: \"openai\"\n");
-    yaml.push_str("#     api_key: \"sk-...\"\n");
-    yaml.push_str("#     llm_base_url: \"https://example.com/v1\"\n");
-    yaml.push_str("#     default_model: \"gpt-5.2\"\n");
-    yaml.push_str("#     models: [\"gpt-5.2\", \"gpt-5.2-mini\"]\n");
+    if provider_presets.is_empty() {
+        yaml.push_str("# Optional reusable provider presets for per-bot/channel selection\n");
+        yaml.push_str("# provider_presets:\n");
+        yaml.push_str("#   \"1\":\n");
+        yaml.push_str("#     provider: \"openai\"\n");
+        yaml.push_str("#     api_key: \"sk-...\"\n");
+        yaml.push_str("#     llm_base_url: \"https://example.com/v1\"\n");
+        yaml.push_str("#     default_model: \"gpt-5.2\"\n");
+        yaml.push_str("#     models: [\"gpt-5.2\", \"gpt-5.2-mini\"]\n");
+        yaml.push_str("#   deepseek-hk:\n");
+        yaml.push_str("#     provider: \"deepseek\"\n");
+        yaml.push_str("#     api_key: \"sk-...\"\n");
+    } else {
+        yaml.push_str("provider_presets:\n");
+        let yaml_presets = serde_yaml::to_value(&provider_presets).map_err(|e| {
+            MicroClawError::Config(format!("Failed to render provider_presets: {e}"))
+        })?;
+        append_yaml_value(&mut yaml, 2, &yaml_presets);
+    }
     let show_thinking = values
         .get("SHOW_THINKING")
         .map(|v| {
@@ -5964,11 +6541,20 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &SetupApp) {
             if provider.is_empty() && model.is_empty() {
                 String::new()
             } else if provider.is_empty() {
-                model
+                format!("preset=main, model={model}")
             } else if model.is_empty() {
-                format!("provider={provider}")
+                format!("preset={provider}")
             } else {
-                format!("provider={provider}, model={model}")
+                format!("preset={provider}, model={model}")
+            }
+        } else if f.key == llm_provider_presets_json_key() {
+            let presets = app.llm_provider_presets();
+            if presets.is_empty() {
+                String::new()
+            } else {
+                let mut ids: Vec<String> = presets.keys().cloned().collect();
+                ids.sort();
+                format!("{} preset(s): {}", ids.len(), ids.join(", "))
             }
         } else {
             f.display_value(selected && app.editing)
@@ -6093,7 +6679,181 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &SetupApp) {
     .block(Block::default().borders(Borders::ALL).title("Status"));
     frame.render_widget(status, chunks[2]);
 
-    if let Some(page) = &app.llm_override_page {
+    if let Some(page) = &app.provider_preset_page {
+        let overlay_area = frame.area().inner(Margin::new(6, 3));
+        if let Some(picker) = &page.picker {
+            let mut list_lines = Vec::with_capacity(picker.options.len());
+            for (i, (label, _)) in picker.options.iter().enumerate() {
+                let selected = i == picker.selected;
+                let pointer = if selected { "▶ " } else { "  " };
+                let style = if selected {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                list_lines.push(Line::from(Span::styled(format!("{pointer}{label}"), style)));
+            }
+            let overlay = Paragraph::new(list_lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Preset Picker")
+                        .style(Style::default().bg(Color::Black)),
+                )
+                .style(Style::default().bg(Color::Black))
+                .wrap(Wrap { trim: false });
+            frame.render_widget(Clear, overlay_area);
+            frame.render_widget(overlay, overlay_area);
+        } else if page.mode == ProviderPresetPageMode::List {
+            let mut lines = Vec::new();
+            let next_id_hint = SetupApp::next_provider_preset_id(&page.entries);
+            if page.entries.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "No provider presets yet. Press a to add one.",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            } else {
+                for (idx, entry) in page.entries.iter().enumerate() {
+                    let selected = idx == page.selected;
+                    let pointer = if selected { "▶ " } else { "  " };
+                    let model = if entry.default_model.trim().is_empty() {
+                        "(no default model)".to_string()
+                    } else {
+                        entry.default_model.clone()
+                    };
+                    let ref_summary = app.provider_preset_reference_summary(&entry.id);
+                    let in_use_marker = if ref_summary == "unused" {
+                        String::new()
+                    } else {
+                        "  IN USE".to_string()
+                    };
+                    let summary = format!(
+                        "{}  {} / {}  [{}]{}",
+                        entry.id, entry.provider, model, ref_summary, in_use_marker
+                    );
+                    let style = if selected {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!("{pointer}{summary}"),
+                        style,
+                    )));
+                }
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("Next numeric preset id: {next_id_hint}"),
+                Style::default().fg(Color::DarkGray),
+            )));
+            lines.push(Line::from(Span::styled(
+                "a add · Enter edit · d delete only if unused · x reset refs to main and delete · Esc close",
+                Style::default().fg(Color::DarkGray),
+            )));
+            let overlay = Paragraph::new(lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Provider Presets")
+                        .style(Style::default().bg(Color::Black)),
+                )
+                .style(Style::default().bg(Color::Black))
+                .wrap(Wrap { trim: false });
+            frame.render_widget(Clear, overlay_area);
+            frame.render_widget(overlay, overlay_area);
+        } else {
+            let labels = SetupApp::provider_preset_field_labels();
+            let mut lines = Vec::new();
+            if let Some(entry) = page.entries.get(page.selected) {
+                for (idx, label) in labels.iter().enumerate() {
+                    let selected = idx == page.field_selected;
+                    let pointer = if selected { "▶ " } else { "  " };
+                    let raw = match idx {
+                        0 => entry.id.clone(),
+                        1 => entry.provider.clone(),
+                        2 => {
+                            if selected && page.editing {
+                                entry.api_key.clone()
+                            } else {
+                                mask_secret(&entry.api_key)
+                            }
+                        }
+                        3 => entry.base_url.clone(),
+                        4 => entry.default_model.clone(),
+                        5 => entry.models_csv.clone(),
+                        _ => String::new(),
+                    };
+                    let style = if selected {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!("{pointer}{label}: {raw}"),
+                        style,
+                    )));
+                }
+                lines.push(Line::from(""));
+                let refs = app.provider_preset_references(&entry.id);
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "References: {}",
+                        if refs.is_empty() {
+                            "none".to_string()
+                        } else {
+                            refs.join(", ")
+                        }
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "Delete actions: d = delete only when unused; x = reset all refs to main, then delete",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "Use d when you expect zero references. Use x when this preset is still attached somewhere.",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                if entry.id.chars().all(|c| c.is_ascii_digit()) {
+                    lines.push(Line::from(Span::styled(
+                        "Tip: numeric ids are convenient for sequential presets; text ids work too.",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                } else {
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "Tip: next numeric preset id would be {}",
+                            SetupApp::next_provider_preset_id(&page.entries)
+                        ),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Enter edit/select · Esc back · ↑/↓ move · Ctrl+D clear",
+                Style::default().fg(Color::DarkGray),
+            )));
+            let overlay = Paragraph::new(lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Provider Preset Detail")
+                        .style(Style::default().bg(Color::Black)),
+                )
+                .style(Style::default().bg(Color::Black))
+                .wrap(Wrap { trim: false });
+            frame.render_widget(Clear, overlay_area);
+            frame.render_widget(overlay, overlay_area);
+        }
+    } else if let Some(page) = &app.llm_override_page {
         let overlay_area = frame.area().inner(Margin::new(6, 3));
         if let Some(picker) = &app.llm_override_picker {
             let mut list_lines = Vec::with_capacity(picker.options.len());
@@ -6134,6 +6894,8 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &SetupApp) {
                     } else {
                         mask_secret(&raw)
                     }
+                } else if *key == page.provider_key.as_str() && raw.trim().is_empty() {
+                    "main (global default)".to_string()
                 } else {
                     raw
                 };
@@ -6150,6 +6912,13 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &SetupApp) {
                 )));
             }
             lines.push(Line::from(""));
+            if !page.show_legacy_fields {
+                lines.push(Line::from(Span::styled(
+                    "Using preset-only mode. Legacy API/base-url fields stay hidden until an old override exists.",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                lines.push(Line::from(""));
+            }
             lines.push(Line::from(Span::styled(
                 "Enter edit/select · Esc close · ↑/↓/j/k/Ctrl+N/Ctrl+P move",
                 Style::default().fg(Color::DarkGray),
@@ -6366,16 +7135,280 @@ fn run_wizard(mut terminal: DefaultTerminal) -> Result<bool, MicroClawError> {
                 }
             }
 
+            if app.provider_preset_page.is_some() {
+                let mode = app
+                    .provider_preset_page
+                    .as_ref()
+                    .map(|page| page.mode)
+                    .unwrap_or(ProviderPresetPageMode::List);
+                let field_count = SetupApp::provider_preset_field_labels().len();
+                let picker_open = app
+                    .provider_preset_page
+                    .as_ref()
+                    .and_then(|page| page.picker.as_ref())
+                    .is_some();
+                if picker_open {
+                    match key.code {
+                        KeyCode::Esc => {
+                            if let Some(page) = app.provider_preset_page.as_mut() {
+                                page.picker = None;
+                            }
+                            app.status = "Selection closed".into();
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            if let Some(page) = app.provider_preset_page.as_mut() {
+                                if let Some(picker) = page.picker.as_mut() {
+                                    picker.selected = picker.selected.saturating_sub(1);
+                                }
+                            }
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if let Some(page) = app.provider_preset_page.as_mut() {
+                                if let Some(picker) = page.picker.as_mut() {
+                                    picker.selected = (picker.selected + 1)
+                                        .min(picker.options.len().saturating_sub(1));
+                                }
+                            }
+                        }
+                        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if let Some(page) = app.provider_preset_page.as_mut() {
+                                if let Some(picker) = page.picker.as_mut() {
+                                    picker.selected = picker.selected.saturating_sub(1);
+                                }
+                            }
+                        }
+                        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if let Some(page) = app.provider_preset_page.as_mut() {
+                                if let Some(picker) = page.picker.as_mut() {
+                                    picker.selected = (picker.selected + 1)
+                                        .min(picker.options.len().saturating_sub(1));
+                                }
+                            }
+                        }
+                        KeyCode::Enter => app.apply_provider_preset_picker_selection(),
+                        _ => {}
+                    }
+                    continue;
+                }
+                match mode {
+                    ProviderPresetPageMode::List => match key.code {
+                        KeyCode::Esc => {
+                            app.provider_preset_page = None;
+                            app.status = "Closed provider presets".into();
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            if let Some(page) = app.provider_preset_page.as_mut() {
+                                page.selected = page.selected.saturating_sub(1);
+                            }
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if let Some(page) = app.provider_preset_page.as_mut() {
+                                page.selected =
+                                    (page.selected + 1).min(page.entries.len().saturating_sub(1));
+                            }
+                        }
+                        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if let Some(page) = app.provider_preset_page.as_mut() {
+                                page.selected = page.selected.saturating_sub(1);
+                            }
+                        }
+                        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if let Some(page) = app.provider_preset_page.as_mut() {
+                                page.selected =
+                                    (page.selected + 1).min(page.entries.len().saturating_sub(1));
+                            }
+                        }
+                        KeyCode::Char('a') => {
+                            if let Some(page) = app.provider_preset_page.as_mut() {
+                                let next_id = SetupApp::next_provider_preset_id(&page.entries);
+                                page.entries.push(ProviderPresetDraft {
+                                    id: next_id,
+                                    provider: "anthropic".to_string(),
+                                    api_key: String::new(),
+                                    base_url: String::new(),
+                                    default_model: default_model_for_provider("anthropic")
+                                        .to_string(),
+                                    models_csv: default_model_for_provider("anthropic").to_string(),
+                                });
+                                page.selected = page.entries.len().saturating_sub(1);
+                                page.mode = ProviderPresetPageMode::Edit;
+                                page.field_selected = 0;
+                                page.editing = true;
+                            }
+                            let _ = app.sync_provider_preset_page_field();
+                            app.status = "Added provider preset".into();
+                        }
+                        KeyCode::Char('d') => match app.delete_selected_provider_preset(false) {
+                            Ok(_) => app.status = "Deleted provider preset".into(),
+                            Err(e) => app.status = e.to_string(),
+                        },
+                        KeyCode::Char('x') => match app.delete_selected_provider_preset(true) {
+                            Ok(reset_refs) => {
+                                if reset_refs.is_empty() {
+                                    app.status =
+                                        "Deleted provider preset (no references needed reset)"
+                                            .into();
+                                } else {
+                                    app.status = format!(
+                                        "Reset to main and deleted provider preset: {}",
+                                        reset_refs.join(", ")
+                                    );
+                                }
+                            }
+                            Err(e) => app.status = e.to_string(),
+                        },
+                        KeyCode::Enter => {
+                            if let Some(page) = app.provider_preset_page.as_mut() {
+                                if page.entries.is_empty() {
+                                    page.entries.push(ProviderPresetDraft {
+                                        id: SetupApp::next_provider_preset_id(&page.entries),
+                                        provider: "anthropic".to_string(),
+                                        api_key: String::new(),
+                                        base_url: String::new(),
+                                        default_model: default_model_for_provider("anthropic")
+                                            .to_string(),
+                                        models_csv: default_model_for_provider("anthropic")
+                                            .to_string(),
+                                    });
+                                    page.selected = 0;
+                                }
+                                page.mode = ProviderPresetPageMode::Edit;
+                                page.field_selected = 0;
+                                page.editing = false;
+                            }
+                            let _ = app.sync_provider_preset_page_field();
+                            app.status = "Editing provider preset".into();
+                        }
+                        _ => {}
+                    },
+                    ProviderPresetPageMode::Edit => match key.code {
+                        KeyCode::Esc => {
+                            if let Some(page) = app.provider_preset_page.as_mut() {
+                                if page.editing {
+                                    page.editing = false;
+                                    app.status = "Preset field edit canceled".into();
+                                } else {
+                                    page.mode = ProviderPresetPageMode::List;
+                                    page.field_selected = 0;
+                                    app.status = "Back to provider preset list".into();
+                                }
+                            }
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            if let Some(page) = app.provider_preset_page.as_mut() {
+                                if !page.editing {
+                                    page.field_selected = page.field_selected.saturating_sub(1);
+                                }
+                            }
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if let Some(page) = app.provider_preset_page.as_mut() {
+                                if !page.editing {
+                                    page.field_selected = (page.field_selected + 1)
+                                        .min(field_count.saturating_sub(1));
+                                }
+                            }
+                        }
+                        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if let Some(page) = app.provider_preset_page.as_mut() {
+                                if !page.editing {
+                                    page.field_selected = page.field_selected.saturating_sub(1);
+                                }
+                            }
+                        }
+                        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if let Some(page) = app.provider_preset_page.as_mut() {
+                                if !page.editing {
+                                    page.field_selected = (page.field_selected + 1)
+                                        .min(field_count.saturating_sub(1));
+                                }
+                            }
+                        }
+                        KeyCode::Enter => {
+                            let selected_field = app
+                                .provider_preset_page
+                                .as_ref()
+                                .map(|page| page.field_selected)
+                                .unwrap_or(0);
+                            let editing = app
+                                .provider_preset_page
+                                .as_ref()
+                                .map(|page| page.editing)
+                                .unwrap_or(false);
+                            if editing {
+                                if let Some(page) = app.provider_preset_page.as_mut() {
+                                    page.editing = false;
+                                }
+                                let _ = app.sync_provider_preset_page_field();
+                                app.status = "Updated provider preset field".into();
+                            } else if selected_field == 1 {
+                                app.open_provider_preset_provider_picker();
+                            } else if selected_field == 4 {
+                                app.open_provider_preset_model_picker();
+                            } else if let Some(page) = app.provider_preset_page.as_mut() {
+                                page.editing = true;
+                                app.status = "Editing provider preset field".into();
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            let editing = app
+                                .provider_preset_page
+                                .as_ref()
+                                .map(|page| page.editing)
+                                .unwrap_or(false);
+                            if editing {
+                                let mut value = app
+                                    .provider_preset_page
+                                    .as_ref()
+                                    .map(SetupApp::provider_preset_selected_field_value)
+                                    .unwrap_or_default();
+                                value.pop();
+                                app.set_provider_preset_selected_field_value(value);
+                                let _ = app.sync_provider_preset_page_field();
+                            }
+                        }
+                        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            let editing = app
+                                .provider_preset_page
+                                .as_ref()
+                                .map(|page| page.editing)
+                                .unwrap_or(false);
+                            if editing {
+                                app.set_provider_preset_selected_field_value(String::new());
+                                let _ = app.sync_provider_preset_page_field();
+                            }
+                        }
+                        KeyCode::Char(c) => {
+                            let editing = app
+                                .provider_preset_page
+                                .as_ref()
+                                .map(|page| page.editing)
+                                .unwrap_or(false);
+                            if editing {
+                                let mut value = app
+                                    .provider_preset_page
+                                    .as_ref()
+                                    .map(SetupApp::provider_preset_selected_field_value)
+                                    .unwrap_or_default();
+                                value.push(c);
+                                app.set_provider_preset_selected_field_value(value);
+                                let _ = app.sync_provider_preset_page_field();
+                            }
+                        }
+                        _ => {}
+                    },
+                }
+                continue;
+            }
+
             if app.llm_override_page.is_some() {
-                let keys: [String; 4] = if let Some(page) = app.llm_override_page.as_ref() {
-                    [
-                        page.provider_key.clone(),
-                        page.api_key_key.clone(),
-                        page.base_url_key.clone(),
-                        page.model_key.clone(),
-                    ]
+                let keys: Vec<String> = if let Some(page) = app.llm_override_page.as_ref() {
+                    SetupApp::llm_override_keys_for_page(page)
+                        .into_iter()
+                        .map(ToOwned::to_owned)
+                        .collect()
                 } else {
-                    [String::new(), String::new(), String::new(), String::new()]
+                    Vec::new()
                 };
                 if app.llm_override_picker.is_some() {
                     match key.code {
@@ -6456,7 +7489,7 @@ fn run_wizard(mut terminal: DefaultTerminal) -> Result<bool, MicroClawError> {
                         let (selected_key, provider_key, model_key, editing) =
                             if let Some(page) = app.llm_override_page.as_ref() {
                                 (
-                                    keys[page.selected].clone(),
+                                    keys.get(page.selected).cloned().unwrap_or_default(),
                                     page.provider_key.clone(),
                                     page.model_key.clone(),
                                     page.editing,
@@ -6486,7 +7519,9 @@ fn run_wizard(mut terminal: DefaultTerminal) -> Result<bool, MicroClawError> {
                             (false, 0)
                         };
                         if editing {
-                            let key_name = &keys[selected];
+                            let Some(key_name) = keys.get(selected) else {
+                                continue;
+                            };
                             if let Some(field) = app.fields.iter_mut().find(|f| f.key == *key_name)
                             {
                                 field.value.pop();
@@ -6501,7 +7536,9 @@ fn run_wizard(mut terminal: DefaultTerminal) -> Result<bool, MicroClawError> {
                             (false, 0)
                         };
                         if editing {
-                            let key_name = &keys[selected];
+                            let Some(key_name) = keys.get(selected) else {
+                                continue;
+                            };
                             app.set_field_value(key_name, String::new());
                         }
                     }
@@ -6513,7 +7550,9 @@ fn run_wizard(mut terminal: DefaultTerminal) -> Result<bool, MicroClawError> {
                             (false, 0)
                         };
                         if editing {
-                            let key_name = &keys[selected];
+                            let Some(key_name) = keys.get(selected) else {
+                                continue;
+                            };
                             let mut next = app.field_value(key_name);
                             next.push(c);
                             app.set_field_value(key_name, next);
@@ -6806,6 +7845,41 @@ a2a:
     }
 
     #[test]
+    fn test_setup_loads_existing_provider_presets_from_legacy_llm_providers() {
+        let _guard = env_lock();
+        let temp = std::env::temp_dir().join(format!(
+            "microclaw_setup_load_provider_presets_{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&temp).unwrap();
+        std::fs::write(
+            temp.join("microclaw.config.yaml"),
+            r#"
+bot_username: bot
+llm_provider: anthropic
+api_key: key
+llm_providers:
+  "1":
+    provider: openai
+    api_key: preset-key
+    default_model: gpt-5.2
+"#,
+        )
+        .unwrap();
+
+        let app = SetupApp::new();
+        let presets = app.field_value(llm_provider_presets_json_key());
+        assert!(presets.contains("\"1\""));
+        assert!(presets.contains("\"provider\":\"openai\""));
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        let _ = std::fs::remove_file(temp.join("microclaw.config.yaml"));
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
     fn test_a2a_fields_render_in_a2a_section() {
         assert_eq!(SetupApp::section_for_key(a2a_enabled_key()), "A2A");
         assert_eq!(SetupApp::section_for_key(a2a_public_base_url_key()), "A2A");
@@ -6965,6 +8039,194 @@ subagents:
         let _ = fs::remove_file(&yaml_path);
         let _ = fs::remove_file(&backup2_path);
         let _ = fs::remove_dir(config_backup_dir_for(&yaml_path));
+    }
+
+    #[test]
+    fn test_parse_provider_presets_json_rejects_reserved_main() {
+        let err = parse_provider_presets_json_value(
+            r#"{"main":{"provider":"openai"}}"#,
+            llm_provider_presets_json_key(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("reserved"));
+    }
+
+    #[test]
+    fn test_save_config_yaml_writes_provider_presets_and_channel_refs() {
+        let yaml_path = std::env::temp_dir().join(format!(
+            "microclaw_setup_provider_presets_test_{}.yaml",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+
+        let mut values = HashMap::new();
+        values.insert("ENABLED_CHANNELS".into(), "telegram,web".into());
+        values.insert("TELEGRAM_BOT_TOKEN".into(), "new_tok".into());
+        values.insert("BOT_USERNAME".into(), "new_bot".into());
+        values.insert("TELEGRAM_ACCOUNT_ID".into(), "sales".into());
+        values.insert(telegram_llm_provider_key().into(), "1".into());
+        values.insert("LLM_PROVIDER".into(), "anthropic".into());
+        values.insert("LLM_API_KEY".into(), "key".into());
+        values.insert(
+            llm_provider_presets_json_key().into(),
+            r#"{"1":{"provider":"openai","api_key":"preset-key","default_model":"gpt-5.2"}}"#
+                .into(),
+        );
+
+        save_config_yaml(&yaml_path, &values).unwrap();
+
+        let s = fs::read_to_string(&yaml_path).unwrap();
+        assert!(s.contains("provider_presets:\n"));
+        assert!(s.contains("  \"1\":\n") || s.contains("  '1':\n") || s.contains("  1:\n"));
+        assert!(s.contains("    provider: openai\n") || s.contains("    provider: \"openai\"\n"));
+        assert!(
+            s.contains("    default_model: gpt-5.2\n")
+                || s.contains("    default_model: \"gpt-5.2\"\n")
+        );
+        assert!(s.contains("    provider_preset: \"1\"\n"));
+
+        let _ = fs::remove_file(&yaml_path);
+        let _ = fs::remove_dir(config_backup_dir_for(&yaml_path));
+    }
+
+    #[test]
+    fn test_next_provider_preset_id_skips_used_numeric_ids() {
+        let entries = vec![
+            ProviderPresetDraft {
+                id: "1".into(),
+                provider: "openai".into(),
+                api_key: String::new(),
+                base_url: String::new(),
+                default_model: String::new(),
+                models_csv: String::new(),
+            },
+            ProviderPresetDraft {
+                id: "3".into(),
+                provider: "anthropic".into(),
+                api_key: String::new(),
+                base_url: String::new(),
+                default_model: String::new(),
+                models_csv: String::new(),
+            },
+        ];
+        assert_eq!(SetupApp::next_provider_preset_id(&entries), "2");
+    }
+
+    #[test]
+    fn test_provider_preset_references_collect_channel_and_dynamic_slots() {
+        let mut app = SetupApp::new();
+        app.set_field_value(telegram_llm_provider_key(), "1".into());
+        app.set_field_value(&dynamic_slot_llm_provider_key("slack", 1), "1".into());
+        app.set_field_value(&dynamic_slot_id_field_key("slack", 1), "sales".into());
+
+        let refs = app.provider_preset_references("1");
+        assert!(refs.iter().any(|v| v == "telegram channel"));
+        assert!(refs.iter().any(|v| v == "slack.sales"));
+    }
+
+    #[test]
+    fn test_renaming_provider_preset_updates_references() {
+        let mut app = SetupApp::new();
+        app.set_field_value(telegram_llm_provider_key(), "1".into());
+        app.set_field_value(&dynamic_slot_llm_provider_key("slack", 1), "1".into());
+        app.set_field_value(&dynamic_slot_id_field_key("slack", 1), "sales".into());
+        app.provider_preset_page = Some(ProviderPresetPage {
+            entries: vec![ProviderPresetDraft {
+                id: "1".into(),
+                provider: "openai".into(),
+                api_key: String::new(),
+                base_url: String::new(),
+                default_model: "gpt-5.2".into(),
+                models_csv: "gpt-5.2".into(),
+            }],
+            selected: 0,
+            mode: ProviderPresetPageMode::Edit,
+            field_selected: 0,
+            editing: true,
+            picker: None,
+        });
+
+        app.set_provider_preset_selected_field_value("2".into());
+
+        assert_eq!(app.field_value(telegram_llm_provider_key()), "2");
+        assert_eq!(
+            app.field_value(&dynamic_slot_llm_provider_key("slack", 1)),
+            "2"
+        );
+        let refs = app.provider_preset_references("2");
+        assert!(refs.iter().any(|v| v == "telegram channel"));
+        assert!(refs.iter().any(|v| v == "slack.sales"));
+    }
+
+    #[test]
+    fn test_delete_selected_provider_preset_blocks_when_referenced() {
+        let mut app = SetupApp::new();
+        app.set_field_value(telegram_llm_provider_key(), "1".into());
+        app.provider_preset_page = Some(ProviderPresetPage {
+            entries: vec![ProviderPresetDraft {
+                id: "1".into(),
+                provider: "openai".into(),
+                api_key: String::new(),
+                base_url: String::new(),
+                default_model: "gpt-5.2".into(),
+                models_csv: "gpt-5.2".into(),
+            }],
+            selected: 0,
+            mode: ProviderPresetPageMode::List,
+            field_selected: 0,
+            editing: false,
+            picker: None,
+        });
+
+        let err = app.delete_selected_provider_preset(false).unwrap_err();
+        assert!(err.to_string().contains("still referenced"));
+        assert_eq!(app.field_value(telegram_llm_provider_key()), "1");
+        assert_eq!(
+            app.provider_preset_page
+                .as_ref()
+                .map(|page| page.entries.len())
+                .unwrap_or_default(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_delete_selected_provider_preset_can_reset_refs_to_main() {
+        let mut app = SetupApp::new();
+        app.set_field_value(telegram_llm_provider_key(), "1".into());
+        app.set_field_value(&dynamic_slot_llm_provider_key("slack", 1), "1".into());
+        app.provider_preset_page = Some(ProviderPresetPage {
+            entries: vec![ProviderPresetDraft {
+                id: "1".into(),
+                provider: "openai".into(),
+                api_key: String::new(),
+                base_url: String::new(),
+                default_model: "gpt-5.2".into(),
+                models_csv: "gpt-5.2".into(),
+            }],
+            selected: 0,
+            mode: ProviderPresetPageMode::List,
+            field_selected: 0,
+            editing: false,
+            picker: None,
+        });
+
+        let updated_refs = app.delete_selected_provider_preset(true).unwrap();
+        assert_eq!(
+            updated_refs,
+            vec!["slack.main".to_string(), "telegram channel".to_string()]
+        );
+        assert_eq!(app.field_value(telegram_llm_provider_key()), "");
+        assert_eq!(
+            app.field_value(&dynamic_slot_llm_provider_key("slack", 1)),
+            ""
+        );
+        assert_eq!(
+            app.provider_preset_page
+                .as_ref()
+                .map(|page| page.entries.len())
+                .unwrap_or_default(),
+            0
+        );
     }
 
     #[test]

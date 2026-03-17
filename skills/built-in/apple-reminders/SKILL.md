@@ -2,7 +2,10 @@
 name: apple-reminders
 description: "Manage Apple Reminders on macOS using `remindctl` (list, add, edit, complete, delete, and list management). Use when users ask to create reminders, check tasks, mark items done, manage to-do lists, or perform task-list operations in Apple Reminders. Triggers on mentions of reminders, to-do, tasks, remind me, or checklist."
 license: Proprietary. LICENSE.txt has complete terms
-compatibility: "macOS only. Requires remindctl (brew install steipete/tap/remindctl)."
+platforms:
+  - darwin
+deps:
+  - remindctl
 ---
 
 # Apple Reminders (remindctl)

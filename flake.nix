@@ -59,7 +59,7 @@
               pkg-config
             ];
             buildInputs = with pkgs; [
-              openssl.out
+              openssl
               sqlite
               libsodium
             ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [

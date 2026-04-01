@@ -142,6 +142,12 @@ jobs:
             target_triple: aarch64-unknown-linux-gnu
             asset_triple: aarch64-linux-gnu
             archive_ext: tar.gz
+          - label: linux-armv7
+            os: ubuntu-latest
+            bin: microclaw
+            target_triple: armv7-unknown-linux-gnueabihf
+            asset_triple: armv7-linux-gnueabihf
+            archive_ext: tar.gz
           - label: macos-x86_64
             os: macos-15-intel
             bin: microclaw
@@ -179,11 +185,19 @@ jobs:
           npm --prefix web ci
           npm --prefix web run build
 
+      - name: Install cross-compilation toolchain (armv7)
+        if: matrix.target_triple == 'armv7-unknown-linux-gnueabihf'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabihf
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target_triple }}
 
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --release --target ${{ matrix.target_triple }}
 
       - name: Package archive (Linux)
         if: matrix.archive_ext == 'tar.gz'
@@ -191,7 +205,7 @@ jobs:
         run: |
           RELEASE_VERSION="${RELEASE_TAG#v}"
           ASSET_NAME="microclaw-${RELEASE_VERSION}-${{ matrix.asset_triple }}.tar.gz"
-          tar -czf "$ASSET_NAME" -C target/release "${{ matrix.bin }}"
+          tar -czf "$ASSET_NAME" -C "target/${{ matrix.target_triple }}/release" "${{ matrix.bin }}"
           echo "ASSET_NAME=$ASSET_NAME" >> "$GITHUB_ENV"
 
       - name: Package archive (Windows)
@@ -200,7 +214,7 @@ jobs:
         run: |
           $releaseVersion = $env:RELEASE_TAG -replace '^v', ''
           $assetName = "microclaw-${releaseVersion}-${{ matrix.asset_triple }}.zip"
-          Compress-Archive -Path "target/release/${{ matrix.bin }}" -DestinationPath $assetName -Force
+          Compress-Archive -Path "target/${{ matrix.target_triple }}/release/${{ matrix.bin }}" -DestinationPath $assetName -Force
           "ASSET_NAME=$assetName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Upload build artifact
@@ -285,7 +299,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

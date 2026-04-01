@@ -57,9 +57,11 @@
             buildFeatures = pkgs.lib.optionals pkgs.stdenv.isLinux [ "journald" "sqlite-vec" ];
             nativeBuildInputs = with pkgs; [
               pkg-config
+              openssl.dev
+              perl
             ];
             buildInputs = with pkgs; [
-              openssl.out
+              openssl
               sqlite
               libsodium
             ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [

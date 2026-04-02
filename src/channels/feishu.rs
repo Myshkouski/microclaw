@@ -165,6 +165,8 @@ pub struct FeishuChannelConfig {
     pub accounts: HashMap<String, FeishuAccountConfig>,
     #[serde(default)]
     pub default_account: Option<String>,
+    #[serde(default)]
+    pub ack_reaction: bool,
 }
 
 fn pick_default_account_id(
@@ -230,6 +232,7 @@ pub fn build_feishu_runtime_contexts(config: &crate::config::Config) -> Vec<Feis
             show_progress: account_cfg.show_progress,
             accounts: HashMap::new(),
             default_account: None,
+            ack_reaction: feishu_cfg.ack_reaction,
         };
         let bot_username = if account_cfg.bot_username.trim().is_empty() {
             config.bot_username_for_channel(&channel_name)
@@ -1329,6 +1332,25 @@ pub(crate) fn system_prompt_extension(caller_channel: &str) -> Option<&'static s
     } else {
         None
     }
+}
+
+// ---------------------------------------------------------------------------
+// ACK Reaction (已读标记)
+// ---------------------------------------------------------------------------
+
+const FEISHU_ACK_REACTIONS: &[&str] = &[
+    "OK", "THUMBSUP", "DONE", "SMILE", "APPLAUSE", "MUSCLE",
+];
+
+fn pick_uniform_index(len: usize, seed: &str) -> usize {
+    debug_assert!(len > 0);
+    // Simple hash-based selection using message text as seed
+    let hash: u64 = seed.bytes().fold(0u64, |acc, b| acc.wrapping_mul(33).wrapping_add(b as u64));
+    (hash as usize) % len
+}
+
+fn random_feishu_ack_reaction(text: &str) -> &'static str {
+    FEISHU_ACK_REACTIONS[pick_uniform_index(FEISHU_ACK_REACTIONS.len(), text)]
 }
 
 fn normalize_reaction_alias(input: &str) -> String {
@@ -2443,6 +2465,42 @@ async fn handle_feishu_event(
         && !feishu_cfg.allowed_chats.iter().any(|c| c == chat_id_str)
     {
         return;
+    }
+
+    // Send ACK reaction (已读标记) — only when enabled in config
+    if feishu_cfg.ack_reaction {
+    let ack_http_client = http_client.clone();
+    let ack_base_url = base_url.to_string();
+    let ack_app_id = feishu_cfg.app_id.clone();
+    let ack_app_secret = feishu_cfg.app_secret.clone();
+    let ack_message_id = message_id.to_string();
+    let ack_text = text.clone();
+    tokio::spawn(async move {
+        // Send ACK reaction with locale-aware emoji
+        let emoji = random_feishu_ack_reaction(&ack_text);
+        let token = match get_token(
+            &ack_http_client,
+            &ack_base_url,
+            &ack_app_id,
+            &ack_app_secret,
+        )
+        .await
+        {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        if let Err(e) = send_feishu_reaction(
+            &ack_http_client,
+            &ack_base_url,
+            &token,
+            &ack_message_id,
+            emoji,
+        )
+        .await
+        {
+            warn!("Feishu: ACK reaction failed for {}: {}", ack_message_id, e);
+        }
+    });
     }
 
     // Group mentions: direct @bot and @all are treated as mention signals.
@@ -3563,5 +3621,19 @@ accounts:
         let runtimes = build_feishu_runtime_contexts(&cfg);
         assert_eq!(runtimes.len(), 1);
         assert!(runtimes[0].config.topic_mode);
+    }
+
+    #[test]
+    fn pick_uniform_index_is_deterministic() {
+        let idx1 = pick_uniform_index(6, "hello");
+        let idx2 = pick_uniform_index(6, "hello");
+        assert_eq!(idx1, idx2);
+        assert!(idx1 < 6);
+    }
+
+    #[test]
+    fn random_feishu_ack_reaction_returns_valid_emoji() {
+        let emoji = random_feishu_ack_reaction("test message");
+        assert!(FEISHU_ACK_REACTIONS.contains(&emoji));
     }
 }

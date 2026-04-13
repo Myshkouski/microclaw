@@ -84,6 +84,7 @@ detect_arch() {
   case "$(uname -m)" in
     x86_64|amd64) echo "x86_64" ;;
     arm64|aarch64) echo "aarch64" ;;
+    armv7*|armhf) echo "armv7" ;;
     *)
       err "Unsupported architecture: $(uname -m)"
       exit 1
@@ -146,6 +147,7 @@ extract_asset_url() {
   case "$arch" in
     x86_64) arch_regex="x86_64|amd64" ;;
     aarch64) arch_regex="aarch64|arm64" ;;
+    armv7) arch_regex="armv7|armhf" ;;
     *)
       err "Unsupported architecture for release matching: $arch"
       return 1
